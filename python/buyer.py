@@ -36,7 +36,7 @@ USDC_MINT = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'
 def load_dotenv() -> None:
     env_path = Path(__file__).resolve().parents[1] / '.env'
     try:
-        lines = env_path.read_text(encoding='utf-8').splitlines()
+        lines = env_path.read_text(encoding='utf-8-sig').splitlines()
     except OSError:
         return
     for line in lines:
