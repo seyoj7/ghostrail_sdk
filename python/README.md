@@ -54,7 +54,7 @@ Withdraw the remaining credit for `SELLER_ADDRESS`:
 python -m python.examples.withdraw_credit
 ```
 
-Register a service using `SERVICE_NAME`, `API_ENDPOINT`, `SELLER_ADDRESS`, and `PRICE_USDC`. Set `API_ENDPOINT` to the service's endpoint, such as `http://127.0.0.1:8080/chat` locally. The endpoint must use HTTPS except for localhost development. The script prints the service ID and one-time delete token; keep that token private and set `SERVICE_ID` and `DELETE_TOKEN` in `.env` to delete the registration later.
+Register a service by setting `SERVICE_NAME`, `API_ENDPOINT`, `SELLER_ADDRESS`, and `PRICE_USDC` in `.env`. Set `API_ENDPOINT` to your service API, such as `http://127.0.0.1:8080/chat` locally; outside localhost it must use HTTPS. The script prints the service ID and one-time delete token. Store the token securely, and set `SERVICE_ID` and `DELETE_TOKEN` in `.env` to delete the registration later.
 
 ```powershell
 python -m python.examples.register_service

@@ -6,25 +6,12 @@ from ..seller import Seller
 
 load_dotenv()
 
-# Edit these values for your service. 
-# The API Endpoint must be HTTPS outside localhost.
-
-SERVICE_NAME = os.getenv("SERVICE_NAME")
-API_ENDPOINT = os.getenv("API_ENDPOINT")
-SELLER_SOLANA_WALLET = os.getenv("SELLER_ADDRESS")
-PRICE_USDC = os.getenv("PRICE_USDC")
-
 service = Seller().register_service(
-    service_name=SERVICE_NAME,
-    api_endpoint=API_ENDPOINT,
-    seller_wallet=SELLER_SOLANA_WALLET,
-    price_usdc=PRICE_USDC,
+    service_name=os.getenv("SERVICE_NAME"),
+    api_endpoint=os.getenv("API_ENDPOINT"),
+    seller_wallet=os.getenv("SELLER_ADDRESS"),
+    price_usdc=os.getenv("PRICE_USDC"),
 )
 
-print("Service registered")
-print(f"Name: {service['name']}")
-print(f"Service ID: {service['id']}")
-print(f"API Endpoint: {service['endpointUrl']}")
-print(f"Seller wallet: {service['sellerWallet']}")
-print(f"Price: {service['priceUsdc']} devnet USDC")
-print(f"Delete token (keep private): {service['deleteToken']}")
+print("Use this service ID in your x402 challenge:", service["id"])
+print("Delete token (store securely):", service["deleteToken"])
