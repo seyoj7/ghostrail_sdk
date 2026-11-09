@@ -20,6 +20,7 @@ loadDotEnv();
 
 const ESCROW_PROGRAM_ID = "AwtzyMZqxncdqDgpXRnQ2s7Y6zKMmEA8YfCDdLqsPefM";
 const USDC_MINT = "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU";
+const DEFAULT_FACILITATOR_URL = "https://ghostrail-five.vercel.app";
 const DEFAULT_SOLANA_RPC_URL = "https://api.devnet.solana.com";
 const COMMITMENT = "confirmed";
 const MIN_DEPOSIT = 1_000_000n;
@@ -86,7 +87,9 @@ function deriveVaultAddress(programId, credit) {
 
 function formatUsdc(amount) {
   const baseUnits = BigInt(amount);
-  return `${baseUnits / 1_000_000n}.${(baseUnits % 1_000_000n).toString().padStart(6, "0")} USDC (${baseUnits.toLocaleString("en-US")} base units)`;
+  const whole = baseUnits / 1_000_000n;
+  const fraction = (baseUnits % 1_000_000n).toString().padStart(6, "0");
+  return `${whole}.${fraction} USDC (${baseUnits.toLocaleString("en-US")} base units)`;
 }
 
 async function jsonResponse(response) {
@@ -106,10 +109,51 @@ async function confirm(connection, signature, blockhash, lastValidBlockHeight) {
   if (result.value.err) throw new Error(`Solana transaction failed: ${JSON.stringify(result.value.err)}`);
 }
 
+async function postServiceRequest(apiEndpoint, prompt, timeoutMs, payment) {
+  const headers = { "Content-Type": "application/json" };
+  if (payment) headers["X-PAYMENT"] = payment;
+
+  try {
+    return await fetch(apiEndpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ prompt }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (error) {
+    if (error?.name !== "TimeoutError" && error?.name !== "AbortError") throw error;
+
+    if (payment) {
+      throw new Error(
+        `Paid service did not respond within ${timeoutMs / 1000} seconds: ${apiEndpoint}`,
+        { cause: error },
+      );
+    }
+
+    const timeoutMessage =
+      `Service did not return payment requirements within ${timeoutMs / 1000} seconds: ` +
+      `${apiEndpoint}. Check that the service is running and reachable.`;
+    throw new Error(timeoutMessage, { cause: error });
+  }
+}
+
+function decodePaymentReceipt(header) {
+  if (!header) throw new Error("Service response did not include X-PAYMENT-RESPONSE");
+
+  try {
+    if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(header)) {
+      throw new Error("invalid base64");
+    }
+    return JSON.parse(Buffer.from(header, "base64").toString("utf8"));
+  } catch (error) {
+    throw new Error("Service returned an invalid X-PAYMENT-RESPONSE header", { cause: error });
+  }
+}
+
 export class Ghostrail {
   constructor({
     rpcUrl = process.env.SOLANA_RPC_URL || DEFAULT_SOLANA_RPC_URL,
-    facilitatorUrl = process.env.FACILITATOR_URL || "https://ghostrail-five.vercel.app",
+    facilitatorUrl = DEFAULT_FACILITATOR_URL,
   } = {}) {
     this.connection = new Connection(requireValue("SOLANA_RPC_URL", rpcUrl), COMMITMENT);
     this.programId = asPublicKey(ESCROW_PROGRAM_ID, "ESCROW_PROGRAM_ID");
@@ -139,27 +183,34 @@ export class Ghostrail {
     return formatUsdc(data.readBigUInt64LE(104)).split(" ")[0];
   }
 
-  async callService(buyerPrivateKey, apiEndpoint, prompt = "Explain Solana escrow in one sentence.", serviceId) {
+  /** Call an HTTP service that uses the GHOSTRAIL prepaid x402 flow. */
+  async callService(
+    buyerPrivateKey,
+    apiEndpoint,
+    prompt,
+    serviceId,
+  ) {
     const buyer = asKeypair(buyerPrivateKey);
     requireValue("apiEndpoint", apiEndpoint);
-    let challengeResponse;
-    try {
-      challengeResponse = await fetch(apiEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt }),
-        signal: AbortSignal.timeout(SERVICE_PROBE_TIMEOUT_MS),
-      });
-    } catch (error) {
-      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-        throw new Error(`Service did not return payment requirements within ${SERVICE_PROBE_TIMEOUT_MS / 1000} seconds: ${apiEndpoint}. Check that the service is running and reachable.`, { cause: error });
-      }
-      throw error;
-    }
+    requireValue("prompt", prompt);
+    const challengeResponse = await postServiceRequest(
+      apiEndpoint,
+      prompt,
+      SERVICE_PROBE_TIMEOUT_MS,
+    );
     if (challengeResponse.status !== 402) {
       const body = await jsonResponse(challengeResponse);
-      if (!challengeResponse.ok) throw new Error(`Service returned HTTP ${challengeResponse.status}: ${JSON.stringify(body)}`);
-      return { response: body.response ?? body, transaction: null, endpoint: apiEndpoint, service_id: serviceId ?? process.env.SERVICE_ID ?? null };
+      if (!challengeResponse.ok) {
+        throw new Error(
+          `Service returned HTTP ${challengeResponse.status}: ${JSON.stringify(body)}`,
+        );
+      }
+      return {
+        response: body.response ?? body,
+        transaction: null,
+        endpoint: apiEndpoint,
+        service_id: serviceId ?? process.env.SERVICE_ID ?? null,
+      };
     }
 
     const challenge = await jsonResponse(challengeResponse);
@@ -187,7 +238,10 @@ export class Ghostrail {
     const credit = deriveCreditAddress(this.programId, buyer.publicKey, seller, this.mint);
     const account = await this.getCreditAccount(buyer.publicKey, seller);
     if (account.balance < amount) {
-      throw new Error(`Insufficient prepaid credit (${formatUsdc(account.balance)} available; ${formatUsdc(amount)} required)`);
+      throw new Error(
+        `Insufficient prepaid credit (${formatUsdc(account.balance)} available; ` +
+        `${formatUsdc(amount)} required)`,
+      );
     }
 
     const vault = deriveVaultAddress(this.programId, credit);
@@ -221,33 +275,18 @@ export class Ghostrail {
       payload: { transaction: signedBase64 },
     })).toString("base64");
 
-    let response;
-    try {
-      response = await fetch(apiEndpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "X-PAYMENT": payment },
-        body: JSON.stringify({ prompt }),
-        signal: AbortSignal.timeout(SERVICE_CALL_TIMEOUT_MS),
-      });
-    } catch (error) {
-      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
-        throw new Error(`Paid service did not respond within ${SERVICE_CALL_TIMEOUT_MS / 1000} seconds: ${apiEndpoint}`, { cause: error });
-      }
-      throw error;
-    }
+    const response = await postServiceRequest(
+      apiEndpoint,
+      prompt,
+      SERVICE_CALL_TIMEOUT_MS,
+      payment,
+    );
     const body = await jsonResponse(response);
-    if (!response.ok) throw new Error(`Paid service returned HTTP ${response.status}: ${JSON.stringify(body)}`);
-    const receiptHeader = response.headers.get("X-PAYMENT-RESPONSE");
-    if (!receiptHeader) throw new Error("Service response did not include X-PAYMENT-RESPONSE");
-    let receipt;
-    try {
-      if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(receiptHeader)) {
-        throw new Error("invalid base64");
-      }
-      receipt = JSON.parse(Buffer.from(receiptHeader, "base64").toString("utf8"));
-    } catch (error) {
-      throw new Error("Service returned an invalid X-PAYMENT-RESPONSE header", { cause: error });
+    if (!response.ok) {
+      throw new Error(`Paid service returned HTTP ${response.status}: ${JSON.stringify(body)}`);
     }
+    const receiptHeader = response.headers.get("X-PAYMENT-RESPONSE");
+    const receipt = decodePaymentReceipt(receiptHeader);
     if (
       body.payment?.accepted !== true || body.charge?.success !== true ||
       receipt?.success !== true || receipt?.network !== "solana-devnet" ||
@@ -318,7 +357,9 @@ export class Ghostrail {
       throw new Error(`Facilitator request failed: ${error.message}`, { cause: error });
     }
     const result = await jsonResponse(response);
-    if (!response.ok || result.success !== true) throw new Error(`Prepaid USDC deposit failed: ${JSON.stringify(result)}`);
+    if (!response.ok || result.success !== true) {
+      throw new Error(`Prepaid USDC deposit failed: ${JSON.stringify(result)}`);
+    }
     console.log(`Deposit confirmed: ${result.signature}`);
     console.log(`Available credit : ${formatUsdc(BigInt(result.balance))}`);
     return result;
@@ -365,10 +406,28 @@ export class Ghostrail {
     if (action !== "release" && action !== "refund") {
       throw new Error('Escrow action must be "release" or "refund"');
     }
-    const escrowKey = asPublicKey(escrowAddress, "escrowAddress");
+    if (!authority) {
+      if (action === "refund") {
+        authority = asKeypair(process.env.BUYER_PRIVATE_KEY);
+      } else if (process.env.SELLER_PRIVATE_KEY) {
+        authority = asKeypair(process.env.SELLER_PRIVATE_KEY);
+      } else if (process.env.BUYER_PRIVATE_KEY) {
+        authority = asKeypair(process.env.BUYER_PRIVATE_KEY);
+      } else {
+        throw new Error("A signing key is required for settlement");
+      }
+    }
+    if (!escrowAddress && action !== "refund") {
+      throw new Error("escrowAddress is required for release");
+    }
+    const escrowKey = escrowAddress
+      ? asPublicKey(escrowAddress, "escrowAddress")
+      : await this.findRefundableEscrow(authority.publicKey);
     const account = await this.connection.getAccountInfo(escrowKey, COMMITMENT);
     if (
-      !account || !account.owner.equals(this.programId) || account.data.length < 130 ||
+      !account ||
+      !account.owner.equals(this.programId) ||
+      account.data.length < 130 ||
       !account.data.subarray(0, 8).equals(ESCROW_ACCOUNT_DISCRIMINATOR)
     ) {
       throw new Error(`Escrow account was not found at ${escrowKey.toBase58()}`);
@@ -384,19 +443,10 @@ export class Ghostrail {
       throw new Error(`Refund is not available for ${timeout - Math.floor(Date.now() / 1000)} more seconds`);
     }
 
-    if (!authority) {
-      if (action === "refund") {
-        authority = asKeypair(process.env.BUYER_PRIVATE_KEY);
-      } else if (process.env.SELLER_PRIVATE_KEY) {
-        authority = asKeypair(process.env.SELLER_PRIVATE_KEY);
-      } else if (process.env.BUYER_PRIVATE_KEY) {
-        authority = asKeypair(process.env.BUYER_PRIVATE_KEY);
-      } else {
-        throw new Error("A signing key is required for settlement");
-      }
-    }
     if (action === "release" && !authority.publicKey.equals(seller)) {
-      throw new Error(`Signing key ${authority.publicKey.toBase58()} does not match escrow seller ${seller.toBase58()}`);
+      throw new Error(
+        `Signing key ${authority.publicKey.toBase58()} does not match escrow seller ${seller.toBase58()}`,
+      );
     }
 
     const facilitator = action === "release"
@@ -448,7 +498,9 @@ export class Ghostrail {
       recentBlockhash: blockhash,
     }).add(instruction);
     transaction.partialSign(authority);
-    const transactionBase64 = transaction.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64");
+    const transactionBase64 = transaction
+      .serialize({ requireAllSignatures: false, verifySignatures: false })
+      .toString("base64");
 
     let response;
     try {
@@ -472,6 +524,57 @@ export class Ghostrail {
 
   async refundEscrow(escrowAddress, authority = null) {
     return this.settleEscrowAction("refund", escrowAddress, authority);
+  }
+
+  async refundAllExpiredEscrows(authority = null) {
+    if (!authority) authority = asKeypair(process.env.BUYER_PRIVATE_KEY);
+    const addresses = await this.findRefundableEscrows(authority.publicKey);
+    if (addresses.length === 0) {
+      throw new Error("No expired, locked escrow was found for this buyer");
+    }
+    const results = [];
+    for (const address of addresses) {
+      try {
+        const result = await this.settleEscrowAction("refund", address, authority);
+        results.push({ escrowAddress: address.toBase58(), signature: result.signature });
+      } catch (error) {
+        results.push({ escrowAddress: address.toBase58(), error: error.message });
+      }
+    }
+    return results;
+  }
+
+  async findRefundableEscrows(buyer) {
+    const now = Math.floor(Date.now() / 1000);
+    const accounts = await this.connection.getProgramAccounts(this.programId, {
+      commitment: COMMITMENT,
+      filters: [{ memcmp: { offset: 8, bytes: buyer.toBase58() } }],
+    });
+    const candidates = accounts.filter(({ account }) => {
+      const data = account.data;
+      return (
+        data.length >= 130 &&
+        data.subarray(0, 8).equals(ESCROW_ACCOUNT_DISCRIMINATOR) &&
+        data.subarray(72, 104).equals(this.mint.toBuffer()) &&
+        data[128] === 0 &&
+        Number(data.readBigInt64LE(112)) <= now
+      );
+    });
+    return candidates.map(({ pubkey }) => pubkey);
+  }
+
+  async findRefundableEscrow(buyer) {
+    const candidates = await this.findRefundableEscrows(buyer);
+    if (candidates.length === 0) {
+      throw new Error("No expired, locked escrow was found for this buyer");
+    }
+    if (candidates.length > 1) {
+      throw new Error(
+        `Found ${candidates.length} refundable escrows for this buyer; ` +
+        "pass one to refundEscrow(address)",
+      );
+    }
+    return candidates[0];
   }
 
   async getCreditAccount(buyer, seller) {

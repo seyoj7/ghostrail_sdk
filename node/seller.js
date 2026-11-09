@@ -5,9 +5,34 @@ loadDotEnv();
 const DEFAULT_FACILITATOR_URL = "https://ghostrail-five.vercel.app";
 const FACILITATOR_TIMEOUT_MS = 15_000;
 
+async function requestJson(url, options, operation, expectJson = true) {
+  let response;
+  try {
+    response = await fetch(url, {
+      ...options,
+      signal: AbortSignal.timeout(FACILITATOR_TIMEOUT_MS),
+    });
+  } catch (error) {
+    throw new Error(`Could not reach GHOSTRAIL facilitator at ${url}`, { cause: error });
+  }
+
+  let result = {};
+  try {
+    result = await response.json();
+  } catch {
+    if (response.ok && expectJson) {
+      throw new Error(`Facilitator returned invalid JSON (HTTP ${response.status})`);
+    }
+  }
+  if (!response.ok) {
+    throw new Error(`${operation} failed: ${result?.error || `HTTP ${response.status}`}`);
+  }
+  return result;
+}
+
 /** Register a seller's service API and devnet USDC price with GHOSTRAIL. */
 export class Seller {
-  constructor(facilitatorUrl = process.env.FACILITATOR_URL || DEFAULT_FACILITATOR_URL) {
+  constructor(facilitatorUrl = DEFAULT_FACILITATOR_URL) {
     this.facilitatorUrl = facilitatorUrl.replace(/\/+$/, "");
   }
 
@@ -17,9 +42,9 @@ export class Seller {
     if (!sellerWallet) throw new Error("SELLER_ADDRESS must be set before registering a service");
     if (!priceUsdc) throw new Error("PRICE_USDC must be set before registering a service");
 
-    let response;
-    try {
-      response = await fetch(`${this.facilitatorUrl}/api/services`, {
+    const result = await requestJson(
+      `${this.facilitatorUrl}/api/services`,
+      {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -28,21 +53,9 @@ export class Seller {
           sellerWallet,
           priceUsdc: String(priceUsdc),
         }),
-        signal: AbortSignal.timeout(FACILITATOR_TIMEOUT_MS),
-      });
-    } catch (error) {
-      throw new Error(`Could not reach GHOSTRAIL facilitator at ${this.facilitatorUrl}`, { cause: error });
-    }
-
-    let result;
-    try {
-      result = await response.json();
-    } catch {
-      throw new Error(`Facilitator returned invalid JSON (HTTP ${response.status})`);
-    }
-    if (!response.ok) {
-      throw new Error(`Service registration failed: ${result?.error || `HTTP ${response.status}`}`);
-    }
+      },
+      "Service registration",
+    );
     if (!result || typeof result !== "object" || !result.id) {
       throw new Error("Facilitator returned an invalid service response");
     }
@@ -56,26 +69,14 @@ export class Seller {
     if (!serviceId) throw new Error("SERVICE_ID must be set before deleting a service");
     if (!deleteToken) throw new Error("DELETE_TOKEN must be set before deleting a service");
 
-    let response;
-    try {
-      response = await fetch(
-        `${this.facilitatorUrl}/api/services/${encodeURIComponent(serviceId)}`,
-        {
-          method: "DELETE",
-          headers: { Authorization: `Bearer ${deleteToken}` },
-          signal: AbortSignal.timeout(FACILITATOR_TIMEOUT_MS),
-        },
-      );
-    } catch (error) {
-      throw new Error(`Could not reach GHOSTRAIL facilitator at ${this.facilitatorUrl}`, { cause: error });
-    }
-    if (response.ok) return;
-    let result;
-    try {
-      result = await response.json();
-    } catch {
-      result = {};
-    }
-    throw new Error(`Service deletion failed: ${result?.error || `HTTP ${response.status}`}`);
+    await requestJson(
+      `${this.facilitatorUrl}/api/services/${encodeURIComponent(serviceId)}`,
+      {
+        method: "DELETE",
+        headers: { Authorization: `Bearer ${deleteToken}` },
+      },
+      "Service deletion",
+      false,
+    );
   }
 }

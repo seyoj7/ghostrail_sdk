@@ -29,15 +29,14 @@ Install dependencies from the SDK directory:
 npm install --prefix node
 ```
 
-Set the wallet and service values in the SDK-root `.env` file. The escrow program ID and devnet USDC mint are fixed in the SDK. The facilitator defaults to `https://ghostrail-five.vercel.app`; set `FACILITATOR_URL` in `.env` to use another facilitator. Node.js 20.6 or newer is required.
 
 For existing escrow settlements, use `releaseEscrow(escrowAddress)` or
-`refundEscrow(escrowAddress)` on a `Ghostrail` client. Releases use the seller
-signer and facilitator relay. Refunds require the buyer key and devnet SOL for
-the transaction fee. Refunds are available after timeout and return funds to
-the buyer recorded in the escrow. Set `GHOSTRAIL_ACTION=refund` and
-`ESCROW_ADDRESS` in `.env`, then run the existing service-call example. The
-buyer's private key signs the refund locally; the SDK sends only the signed
+`refundEscrow()` on a `Ghostrail` client. Refunds scan the buyer's on-chain
+escrows and automatically select an expired locked escrow. If multiple escrows
+are refundable, pass one explicitly to `refundEscrow(escrowAddress)`. Releases
+use the seller signer and facilitator relay. Refunds are buyer-initiated after
+timeout; they require the buyer key and devnet SOL for the transaction fee.
+The buyer's private key signs the refund locally; the SDK sends only the signed
 transaction to the facilitator. Refunds do not need facilitator signing
 credentials.
 
@@ -51,6 +50,14 @@ node node/examples/call-service.mjs
 
 Calls a paid service using prepaid credit. Prints the response, transaction,
 API endpoint, and service ID. Configure `API_ENDPOINT` and `PROMPT` in `.env`.
+
+Submit refunds for all of the buyer's expired, locked escrows without calling a
+paid service. The script submits one buyer-signed transaction per escrow; each
+transaction requires devnet SOL for its network fee.
+
+```powershell
+node node/examples/refund-escrow.mjs
+```
 
 ```powershell
 node node/examples/check-credit.mjs

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable, cast
 from urllib.error import HTTPError, URLError
@@ -26,13 +27,17 @@ from spl.token.constants import ASSOCIATED_TOKEN_PROGRAM_ID, TOKEN_PROGRAM_ID
 from spl.token.instructions import get_associated_token_address
 
 BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
-
 LAMPORTS_PER_SOL = 1000000000
-
 COMMITMENT = Confirmed
 ESCROW_PROGRAM_ID = 'AwtzyMZqxncdqDgpXRnQ2s7Y6zKMmEA8YfCDdLqsPefM'
 USDC_MINT = '4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU'
+DEFAULT_FACILITATOR_URL = 'https://ghostrail-five.vercel.app'
+DEFAULT_SOLANA_RPC_URL = 'https://api.devnet.solana.com'
+SERVICE_PROBE_TIMEOUT_SECONDS = 120
+MIN_CREDIT_DEPOSIT = 1000000
+MAX_CREDIT_BALANCE = 100000000
 
+# Environment, key, and transaction helpers
 def load_dotenv() -> None:
     env_path = Path(__file__).resolve().parents[1] / '.env'
     try:
@@ -69,31 +74,53 @@ def base58_encode(value: bytes) -> str:
     leading_zeroes = len(value) - len(value.lstrip(b'\x00'))
     return '1' * leading_zeroes + (encoded or '')
 
-def account_meta(pubkey: Pubkey, *, signer: bool, writable: bool) -> AccountMeta:
+def account_meta(
+    pubkey: Pubkey,
+    *,
+    signer: bool,
+    writable: bool,
+) -> AccountMeta:
     return AccountMeta(pubkey, is_signer=signer, is_writable=writable)
 
 def instruction(program_id: Pubkey, data: bytes, accounts: Iterable[AccountMeta]) -> Instruction:
     return Instruction(program_id, data, list(accounts))
 
-def signed_transaction(instructions: list[Instruction], payer: Keypair, recent_blockhash: Hash) -> Transaction:
+def signed_transaction(
+    instructions: list[Instruction],
+    payer: Keypair,
+    recent_blockhash: Hash,
+) -> Transaction:
     message = Message(instructions, payer.pubkey())
     return Transaction([payer], message, recent_blockhash)
 
-def partially_signed_transaction(instructions: list[Instruction], payer: Pubkey, authority: Keypair, recent_blockhash: Hash) -> Transaction:
+def partially_signed_transaction(
+    instructions: list[Instruction],
+    payer: Pubkey,
+    authority: Keypair,
+    recent_blockhash: Hash,
+) -> Transaction:
     message = Message(instructions, payer)
     transaction = Transaction.new_unsigned(message)
     transaction.partial_sign([authority], recent_blockhash)
     return transaction
 
 async def send_transaction(client: AsyncClient, transaction: Transaction) -> str:
-    response = await client.send_raw_transaction(bytes(transaction), opts=TxOpts(skip_confirmation=False, preflight_commitment=COMMITMENT))
+    response = await client.send_raw_transaction(
+        bytes(transaction),
+        opts=TxOpts(skip_confirmation=False, preflight_commitment=COMMITMENT),
+    )
     return str(response.value)
 
 def facilitator_request(url: str, method: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
     return json_request(f"{url.rstrip('/')}/api/settlements", method, payload)
 
 def json_request(url: str, method: str, payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-    request = Request(url, method=method, headers={'Content-Type': 'application/json'}, data=json.dumps(payload).encode('utf-8'))
+    request = Request(
+        url,
+        method=method,
+        headers={'Content-Type': 'application/json'},
+        data=json.dumps(payload).encode('utf-8'),
+    )
     try:
         with urlopen(request, timeout=30) as response:
             status = response.status
@@ -120,6 +147,7 @@ RELEASE_DISCRIMINATOR = bytes([253, 249, 15, 206, 28, 127, 193, 241])
 
 REFUND_DISCRIMINATOR = bytes([2, 96, 183, 251, 63, 208, 46, 46])
 
+# Legacy timed-escrow settlement
 def parse_escrow(account: Any | None, address: str, program_id: Pubkey) -> dict[str, Any]:
     account_info = cast(Any, account)
     if account_info is None or account_info.owner != program_id:
@@ -129,10 +157,16 @@ def parse_escrow(account: Any | None, address: str, program_id: Pubkey) -> dict[
         raise ValueError(f'Escrow account was not found at {address}')
     if data[:8] != ESCROW_ACCOUNT_DISCRIMINATOR:
         raise ValueError('The address is not a GHOSTRAIL escrow account')
-    return {'buyer': Pubkey.from_bytes(data[8:40]), 'seller': Pubkey.from_bytes(data[40:72]), 'mint': Pubkey.from_bytes(data[72:104]), 'timeout': int.from_bytes(data[112:120], 'little', signed=True), 'state': data[128]}
+    return {
+        'buyer': Pubkey.from_bytes(data[8:40]),
+        'seller': Pubkey.from_bytes(data[40:72]),
+        'mint': Pubkey.from_bytes(data[72:104]),
+        'timeout': int.from_bytes(data[112:120], 'little', signed=True),
+        'state': data[128],
+    }
 
 async def ensure_token_account(client: AsyncClient, payer: Keypair, mint: Pubkey, owner: Pubkey) -> Pubkey:
-    from spl.token.instructions import create_associated_token_account, get_associated_token_address
+    from spl.token.instructions import create_associated_token_account
     address = get_associated_token_address(owner, mint)
     account_info = cast(Any, (await client.get_account_info(address, commitment=COMMITMENT)).value)
     if account_info is None:
@@ -141,19 +175,103 @@ async def ensure_token_account(client: AsyncClient, payer: Keypair, mint: Pubkey
         await send_transaction(client, tx)
     return address
 
-async def settle_escrow_action(action: str, escrow_address_str: str, authority: Keypair | None=None) -> dict[str, Any]:
+def find_refundable_escrows(rpc_url: str, buyer: Pubkey) -> list[Pubkey]:
+    request = Request(
+        rpc_url,
+        data=json.dumps({
+            'jsonrpc': '2.0',
+            'id': 1,
+            'method': 'getProgramAccounts',
+            'params': [ESCROW_PROGRAM_ID, {
+                'encoding': 'base64',
+                'commitment': 'confirmed',
+                'filters': [{'memcmp': {'offset': 8, 'bytes': str(buyer)}}],
+            }],
+        }).encode(),
+        headers={'Content-Type': 'application/json'},
+    )
+    with urlopen(request, timeout=30) as response:
+        payload = json.loads(response.read())
+    if payload.get('error'):
+        raise RuntimeError(f"Solana RPC escrow scan failed: {payload['error'].get('message', payload['error'])}")
+    now = int(time.time())
+    candidates = []
+    for item in payload.get('result', []):
+        raw_data = item.get('account', {}).get('data', [])
+        if not raw_data or len(raw_data) < 2:
+            continue
+        data = base64.b64decode(raw_data[0])
+        if len(data) < 130 or data[:8] != anchor_discriminator('account', 'Escrow'):
+            continue
+        if data[8:40] != bytes(buyer) or data[72:104] != bytes(Pubkey.from_string(USDC_MINT)) or data[128] != 0:
+            continue
+        timeout = int.from_bytes(data[112:120], 'little', signed=True)
+        if timeout <= now:
+            candidates.append(Pubkey.from_string(item['pubkey']))
+    return candidates
+
+def find_refundable_escrow(rpc_url: str, buyer: Pubkey) -> Pubkey:
+    candidates = find_refundable_escrows(rpc_url, buyer)
+    if not candidates:
+        raise ValueError('No expired, locked escrow was found for this buyer')
+    if len(candidates) > 1:
+        addresses = ', '.join(str(address) for address in candidates)
+        raise ValueError(f'Found {len(candidates)} refundable escrows; pass one explicitly: {addresses}')
+    return candidates[0]
+
+async def refund_all_expired_escrows(authority: Keypair) -> list[dict[str, Any]]:
+    rpc_url = os.getenv('SOLANA_RPC_URL', DEFAULT_SOLANA_RPC_URL)
+    escrows = find_refundable_escrows(rpc_url, authority.pubkey())
+    if not escrows:
+        raise ValueError('No expired, locked escrow was found for this buyer')
+    results = []
+    for escrow_address in escrows:
+        try:
+            result = await settle_escrow_action('refund', str(escrow_address), authority)
+            results.append({'escrowAddress': str(escrow_address), 'signature': result['signature']})
+        except Exception as error:
+            results.append({'escrowAddress': str(escrow_address), 'error': str(error)})
+    return results
+
+async def settle_escrow_action(
+    action: str,
+    escrow_address_str: str | None,
+    authority: Keypair | None = None,
+) -> dict[str, Any]:
     load_dotenv()
     if action not in ('release', 'refund'):
         raise ValueError('Escrow action must be release or refund')
     from spl.token.constants import TOKEN_PROGRAM_ID
-    import time
     rpc_url = os.getenv('SOLANA_RPC_URL', DEFAULT_SOLANA_RPC_URL)
     program_id = Pubkey.from_string(ESCROW_PROGRAM_ID)
     expected_mint = Pubkey.from_string(USDC_MINT)
-    escrow_address = Pubkey.from_string(escrow_address_str)
-    facilitator_url = os.getenv('FACILITATOR_URL', 'https://ghostrail-five.vercel.app')
+    facilitator_url = DEFAULT_FACILITATOR_URL
+    if authority is None:
+        if action == 'refund':
+            authority = load_keypair('BUYER_PRIVATE_KEY', os.getenv('BUYER_PRIVATE_KEY'))
+        elif os.getenv('SELLER_PRIVATE_KEY'):
+            authority = load_keypair('SELLER_PRIVATE_KEY', os.getenv('SELLER_PRIVATE_KEY'))
+        elif os.getenv('BUYER_PRIVATE_KEY'):
+            authority = load_keypair('BUYER_PRIVATE_KEY', os.getenv('BUYER_PRIVATE_KEY'))
+        else:
+            raise ValueError('A signing key is required for settlement')
+    if not escrow_address_str and action != 'refund':
+        raise ValueError('escrowAddress is required for release')
+    escrow_address = (
+        Pubkey.from_string(escrow_address_str)
+        if escrow_address_str
+        else find_refundable_escrow(rpc_url, authority.pubkey())
+    )
     async with AsyncClient(rpc_url, commitment=COMMITMENT) as client:
-        escrow = parse_escrow(cast(Any, (await client.get_account_info(escrow_address, commitment=COMMITMENT)).value), str(escrow_address), program_id)
+        escrow_account = await client.get_account_info(
+            escrow_address,
+            commitment=COMMITMENT,
+        )
+        escrow = parse_escrow(
+            cast(Any, escrow_account.value),
+            str(escrow_address),
+            program_id,
+        )
         buyer = escrow['buyer']
         seller = escrow['seller']
         mint = escrow['mint']
@@ -164,21 +282,19 @@ async def settle_escrow_action(action: str, escrow_address_str: str, authority: 
             raise ValueError('Escrow mint does not match USDC_MINT')
         if action == 'refund' and int(time.time()) < timeout:
             raise ValueError(f'Refund is not available for {timeout - int(time.time())} more seconds')
-        if authority is None:
-            if action == 'refund':
-                authority = load_keypair('BUYER_PRIVATE_KEY', os.getenv('BUYER_PRIVATE_KEY'))
-            elif os.getenv('SELLER_PRIVATE_KEY'):
-                authority = load_keypair('SELLER_PRIVATE_KEY', os.getenv('SELLER_PRIVATE_KEY'))
-            elif os.getenv('BUYER_PRIVATE_KEY'):
-                authority = load_keypair('BUYER_PRIVATE_KEY', os.getenv('BUYER_PRIVATE_KEY'))
-            else:
-                raise ValueError('A signing key is required for settlement')
         if action == 'release' and authority.pubkey() != seller:
             raise ValueError(f'Signing key {authority.pubkey()} does not match escrow seller {seller}')
         facilitator = None
         if action == 'release':
             facilitator_value = os.getenv('FACILITATOR_PUBLIC_KEY')
-            facilitator = Pubkey.from_string(facilitator_value) if facilitator_value else load_keypair('FACILITATOR_PRIVATE_KEY', os.getenv('FACILITATOR_PRIVATE_KEY')).pubkey()
+            facilitator = (
+                Pubkey.from_string(facilitator_value)
+                if facilitator_value
+                else load_keypair(
+                    'FACILITATOR_PRIVATE_KEY',
+                    os.getenv('FACILITATOR_PRIVATE_KEY'),
+                ).pubkey()
+            )
         if action == 'refund' and authority.pubkey() != buyer:
             raise ValueError('Only the buyer recorded in the escrow can submit a manual refund')
         if action == 'release' and authority.pubkey() == facilitator:
@@ -187,9 +303,29 @@ async def settle_escrow_action(action: str, escrow_address_str: str, authority: 
         recipient_token = await ensure_token_account(client, authority, mint, recipient)
         vault, _ = Pubkey.find_program_address([b'vault', bytes(escrow_address)], program_id)
         if action == 'release':
-            settlement_instruction = instruction(program_id, RELEASE_DISCRIMINATOR, [account_meta(buyer, signer=False, writable=True), account_meta(seller, signer=True, writable=False), account_meta(mint, signer=False, writable=False), account_meta(escrow_address, signer=False, writable=True), account_meta(vault, signer=False, writable=True), account_meta(recipient_token, signer=False, writable=True), account_meta(TOKEN_PROGRAM_ID, signer=False, writable=False)])
+            accounts = [
+                account_meta(buyer, signer=False, writable=True),
+                account_meta(seller, signer=True, writable=False),
+                account_meta(mint, signer=False, writable=False),
+                account_meta(escrow_address, signer=False, writable=True),
+                account_meta(vault, signer=False, writable=True),
+                account_meta(recipient_token, signer=False, writable=True),
+                account_meta(TOKEN_PROGRAM_ID, signer=False, writable=False),
+            ]
+            discriminator = RELEASE_DISCRIMINATOR
         else:
-            settlement_instruction = instruction(program_id, REFUND_DISCRIMINATOR, [account_meta(authority.pubkey(), signer=True, writable=False), account_meta(buyer, signer=False, writable=True), account_meta(seller, signer=False, writable=False), account_meta(mint, signer=False, writable=False), account_meta(escrow_address, signer=False, writable=True), account_meta(vault, signer=False, writable=True), account_meta(recipient_token, signer=False, writable=True), account_meta(TOKEN_PROGRAM_ID, signer=False, writable=False)])
+            accounts = [
+                account_meta(authority.pubkey(), signer=True, writable=False),
+                account_meta(buyer, signer=False, writable=True),
+                account_meta(seller, signer=False, writable=False),
+                account_meta(mint, signer=False, writable=False),
+                account_meta(escrow_address, signer=False, writable=True),
+                account_meta(vault, signer=False, writable=True),
+                account_meta(recipient_token, signer=False, writable=True),
+                account_meta(TOKEN_PROGRAM_ID, signer=False, writable=False),
+            ]
+            discriminator = REFUND_DISCRIMINATOR
+        settlement_instruction = instruction(program_id, discriminator, accounts)
         blockhash = cast(Any, (await client.get_latest_blockhash(commitment=COMMITMENT)).value).blockhash
         if action == 'release':
             if facilitator is None:
@@ -198,7 +334,15 @@ async def settle_escrow_action(action: str, escrow_address_str: str, authority: 
         else:
             payer = authority.pubkey()
         transaction = partially_signed_transaction([settlement_instruction], payer, authority, blockhash)
-    status, result = facilitator_request(facilitator_url, 'PUT', {'escrowAddress': str(escrow_address), 'action': action, 'transaction': transaction_base64(transaction)})
+    status, result = facilitator_request(
+        facilitator_url,
+        'PUT',
+        {
+            'escrowAddress': str(escrow_address),
+            'action': action,
+            'transaction': transaction_base64(transaction),
+        },
+    )
     if status < 200 or status >= 300 or result.get('success') is not True:
         raise RuntimeError(f'Settlement failed: {result}')
     return result
@@ -207,9 +351,10 @@ def run(coroutine: Any) -> None:
     try:
         asyncio.run(coroutine)
     except Exception as error:
-        print(str(error), file=__import__('sys').stderr)
+        print(str(error), file=sys.stderr)
         raise SystemExit(1) from error
 
+# Prepaid credit
 def anchor_discriminator(namespace: str, name: str) -> bytes:
     return hashlib.sha256(f'{namespace}:{name}'.encode()).digest()[:8]
 
@@ -226,24 +371,54 @@ def usdc_to_base_units(value: str) -> int:
         raise ValueError('Deposit must be positive USDC')
     return amount
 
-def derive_credit_address(program_id: Pubkey, buyer: Pubkey, seller: Pubkey, mint: Pubkey) -> Pubkey:
-    credit, _ = Pubkey.find_program_address([b'credit', bytes(buyer), bytes(seller), bytes(mint)], program_id)
+def derive_credit_address(
+    program_id: Pubkey,
+    buyer: Pubkey,
+    seller: Pubkey,
+    mint: Pubkey,
+) -> Pubkey:
+    credit, _ = Pubkey.find_program_address(
+        [b'credit', bytes(buyer), bytes(seller), bytes(mint)],
+        program_id,
+    )
     return credit
 
-async def read_credit(rpc_url: str, program_id: Pubkey, buyer: Pubkey, seller: Pubkey, mint: Pubkey) -> tuple[Pubkey, int, int]:
+async def read_credit(
+    rpc_url: str,
+    program_id: Pubkey,
+    buyer: Pubkey,
+    seller: Pubkey,
+    mint: Pubkey,
+) -> tuple[Pubkey, int, int]:
     credit = derive_credit_address(program_id, buyer, seller, mint)
     async with AsyncClient(rpc_url, commitment=COMMITMENT) as client:
         account = cast(Any, (await client.get_account_info(credit, commitment=COMMITMENT)).value)
     if account is None:
         return (credit, 0, 0)
     data = bytes(account.data)
-    if str(account.owner) != str(program_id) or len(data) < 121 or data[:8] != anchor_discriminator('account', 'Credit'):
+    if (
+        str(account.owner) != str(program_id)
+        or len(data) < 121
+        or data[:8] != anchor_discriminator('account', 'Credit')
+    ):
         raise ValueError('Credit PDA contains an invalid GHOSTRAIL account')
-    if Pubkey.from_bytes(data[8:40]) != buyer or Pubkey.from_bytes(data[40:72]) != seller or Pubkey.from_bytes(data[72:104]) != mint:
+    if (
+        Pubkey.from_bytes(data[8:40]) != buyer
+        or Pubkey.from_bytes(data[40:72]) != seller
+        or Pubkey.from_bytes(data[72:104]) != mint
+    ):
         raise ValueError('Credit account does not match this buyer, seller, and mint')
-    return (credit, int.from_bytes(data[104:112], 'little'), int.from_bytes(data[112:120], 'little'))
+    balance = int.from_bytes(data[104:112], 'little')
+    next_nonce = int.from_bytes(data[112:120], 'little')
+    return credit, balance, next_nonce
 
-async def withdraw_all_credit(rpc_url: str, program_id: Pubkey, buyer: Keypair, seller: Pubkey, mint: Pubkey) -> str | None:
+async def withdraw_all_credit(
+    rpc_url: str,
+    program_id: Pubkey,
+    buyer: Keypair,
+    seller: Pubkey,
+    mint: Pubkey,
+) -> str | None:
     credit, balance, _ = await read_credit(rpc_url, program_id, buyer.pubkey(), seller, mint)
     if balance == 0:
         print('No prepaid USDC remains for this buyer and seller.')
@@ -252,44 +427,84 @@ async def withdraw_all_credit(rpc_url: str, program_id: Pubkey, buyer: Keypair, 
     data = anchor_discriminator('global', 'withdraw_credit') + balance.to_bytes(8, 'little')
     async with AsyncClient(rpc_url, commitment=COMMITMENT) as client:
         buyer_token = await ensure_token_account(client, buyer, mint, buyer.pubkey())
-        withdraw_ix = instruction(program_id, data, [account_meta(buyer.pubkey(), signer=True, writable=True), account_meta(mint, signer=False, writable=False), account_meta(credit, signer=False, writable=True), account_meta(vault, signer=False, writable=True), account_meta(buyer_token, signer=False, writable=True), account_meta(TOKEN_PROGRAM_ID, signer=False, writable=False)])
+        withdraw_ix = instruction(
+            program_id,
+            data,
+            [
+                account_meta(buyer.pubkey(), signer=True, writable=True),
+                account_meta(mint, signer=False, writable=False),
+                account_meta(credit, signer=False, writable=True),
+                account_meta(vault, signer=False, writable=True),
+                account_meta(buyer_token, signer=False, writable=True),
+                account_meta(TOKEN_PROGRAM_ID, signer=False, writable=False),
+            ],
+        )
         blockhash = cast(Any, (await client.get_latest_blockhash(commitment=COMMITMENT)).value).blockhash
         tx = signed_transaction([withdraw_ix], buyer, blockhash)
         signature = await send_transaction(client, tx)
     return signature
 
-async def create_and_sign_credit_deposit(rpc_url: str, program_id: Pubkey, buyer: Keypair, seller: Pubkey, mint: Pubkey, amount: int) -> tuple[str, Pubkey]:
+async def create_and_sign_credit_deposit(
+    rpc_url: str,
+    program_id: Pubkey,
+    buyer: Keypair,
+    seller: Pubkey,
+    mint: Pubkey,
+    amount: int,
+) -> tuple[str, Pubkey]:
     async with AsyncClient(rpc_url, commitment=COMMITMENT) as client:
         buyer_balance = cast(Any, (await client.get_balance(buyer.pubkey(), commitment=COMMITMENT)).value)
         if buyer_balance < int(0.01 * LAMPORTS_PER_SOL):
             raise ValueError('Buyer wallet needs at least 0.01 devnet SOL for fees and rent')
         buyer_token = await ensure_token_account(client, buyer, mint, buyer.pubkey())
-        token_balance = cast(Any, (await client.get_token_account_balance(buyer_token, commitment=COMMITMENT)).value)
+        token_balance = cast(
+            Any,
+            (await client.get_token_account_balance(
+                buyer_token,
+                commitment=COMMITMENT,
+            )).value,
+        )
         if int(token_balance.amount) < amount:
-            raise ValueError(f'Buyer token account has insufficient funds ({token_balance.amount} < required {amount})')
+            raise ValueError(
+                f'Buyer token account has insufficient funds '
+                f'({token_balance.amount} < required {amount})'
+            )
         blockhash = cast(Any, (await client.get_latest_blockhash(commitment=COMMITMENT)).value).blockhash
     credit = derive_credit_address(program_id, buyer.pubkey(), seller, mint)
     vault, _ = Pubkey.find_program_address([b'vault', bytes(credit)], program_id)
     buyer_token = get_associated_token_address(buyer.pubkey(), mint)
     seller_token = get_associated_token_address(seller, mint)
     data = anchor_discriminator('global', 'deposit_credit') + amount.to_bytes(8, 'little')
-    deposit_ix = instruction(program_id, data, [account_meta(buyer.pubkey(), signer=True, writable=True), account_meta(seller, signer=False, writable=False), account_meta(mint, signer=False, writable=False), account_meta(credit, signer=False, writable=True), account_meta(buyer_token, signer=False, writable=True), account_meta(vault, signer=False, writable=True), account_meta(seller_token, signer=False, writable=True), account_meta(SYSTEM_PROGRAM_ID, signer=False, writable=False), account_meta(TOKEN_PROGRAM_ID, signer=False, writable=False), account_meta(ASSOCIATED_TOKEN_PROGRAM_ID, signer=False, writable=False)])
+    deposit_ix = instruction(
+        program_id,
+        data,
+        [
+            account_meta(buyer.pubkey(), signer=True, writable=True),
+            account_meta(seller, signer=False, writable=False),
+            account_meta(mint, signer=False, writable=False),
+            account_meta(credit, signer=False, writable=True),
+            account_meta(buyer_token, signer=False, writable=True),
+            account_meta(vault, signer=False, writable=True),
+            account_meta(seller_token, signer=False, writable=True),
+            account_meta(SYSTEM_PROGRAM_ID, signer=False, writable=False),
+            account_meta(TOKEN_PROGRAM_ID, signer=False, writable=False),
+            account_meta(ASSOCIATED_TOKEN_PROGRAM_ID, signer=False, writable=False),
+        ],
+    )
     tx = signed_transaction([deposit_ix], buyer, blockhash)
     return (transaction_base64(tx), credit)
 
 def submit_credit_deposit(facilitator_url: str, transaction_base64_value: str) -> dict[str, Any]:
-    status, payload = json_request(f"{facilitator_url.rstrip('/')}/api/settlements", 'PUT', {'action': 'deposit', 'transaction': transaction_base64_value})
+    status, payload = json_request(
+        f"{facilitator_url.rstrip('/')}/api/settlements",
+        'PUT',
+        {'action': 'deposit', 'transaction': transaction_base64_value},
+    )
     if status < 200 or status >= 300 or payload.get('success') is not True:
         raise RuntimeError(f'Prepaid USDC deposit failed: {payload}')
     return payload
 
-DEFAULT_API_ENDPOINT = 'http://127.0.0.1:8080/chat'
-SERVICE_PROBE_TIMEOUT_SECONDS = 120
-
-DEFAULT_PROMPT = 'Explain Solana escrow in one sentence.'
-
-DEFAULT_SOLANA_RPC_URL = 'https://api.devnet.solana.com'
-
+# x402 paid-service flow
 if sys.platform == 'win32':
     try:
         cast(Any, sys.stdout).reconfigure(encoding='utf-8', errors='replace')
@@ -298,7 +513,11 @@ if sys.platform == 'win32':
         pass
 
 def probe_service_payment_info(api_endpoint: str, prompt: str) -> dict[str, Any]:
-    req = Request(api_endpoint, data=json.dumps({'prompt': prompt}).encode('utf-8'), headers={'Content-Type': 'application/json'})
+    req = Request(
+        api_endpoint,
+        data=json.dumps({'prompt': prompt}).encode('utf-8'),
+        headers={'Content-Type': 'application/json'},
+    )
     try:
         with urlopen(req, timeout=SERVICE_PROBE_TIMEOUT_SECONDS) as response:
             body = json.loads(response.read().decode('utf-8'))
@@ -307,15 +526,35 @@ def probe_service_payment_info(api_endpoint: str, prompt: str) -> dict[str, Any]
             sys.exit(0)
     except HTTPError as error:
         if error.code != 402:
-            raise RuntimeError(f"Service returned unexpected HTTP {error.code}: {error.read().decode('utf-8')}") from error
+            detail = error.read().decode('utf-8', errors='replace')
+            raise RuntimeError(
+                f'Service returned unexpected HTTP {error.code}: {detail}'
+            ) from error
         try:
             payload = json.loads(error.read().decode('utf-8'))
         except (ValueError, json.JSONDecodeError) as decode_err:
             raise RuntimeError('Service returned HTTP 402 with invalid JSON') from decode_err
         if payload.get('x402Version') != 1 or not isinstance(payload.get('accepts'), list):
             raise RuntimeError(f'HTTP 402 response did not provide x402 v1 requirements: {payload}')
-        requirement = next((item for item in payload['accepts'] if isinstance(item, dict) and item.get('scheme') == 'escrow' and (item.get('network') == 'solana-devnet')), None)
-        if not requirement or not requirement.get('payTo') or (not requirement.get('maxAmountRequired')) or (not requirement.get('asset')) or (not isinstance(requirement.get('extra'), dict)) or (not requirement['extra'].get('escrowProgramId')) or (requirement['extra'].get('creditModel') != 'prepaid'):
+        requirement = next(
+            (
+                item
+                for item in payload['accepts']
+                if isinstance(item, dict)
+                and item.get('scheme') == 'escrow'
+                and item.get('network') == 'solana-devnet'
+            ),
+            None,
+        )
+        if (
+            not requirement
+            or not requirement.get('payTo')
+            or not requirement.get('maxAmountRequired')
+            or not requirement.get('asset')
+            or not isinstance(requirement.get('extra'), dict)
+            or not requirement['extra'].get('escrowProgramId')
+            or requirement['extra'].get('creditModel') != 'prepaid'
+        ):
             raise RuntimeError(f'HTTP 402 response did not provide valid escrow requirements: {payload}')
         return requirement
     except TimeoutError as error:
@@ -325,12 +564,32 @@ def probe_service_payment_info(api_endpoint: str, prompt: str) -> dict[str, Any]
             'Check that the service is running and reachable.'
         ) from error
 
-async def create_and_sign_credit_charge(rpc_url: str, program_id: Pubkey, buyer: Keypair, seller: Pubkey, mint: Pubkey, amount: int, nonce: int) -> tuple[str, Pubkey]:
+async def create_and_sign_credit_charge(
+    rpc_url: str,
+    program_id: Pubkey,
+    buyer: Keypair,
+    seller: Pubkey,
+    mint: Pubkey,
+    amount: int,
+    nonce: int,
+) -> tuple[str, Pubkey]:
     credit = derive_credit_address(program_id, buyer.pubkey(), seller, mint)
     vault, _ = Pubkey.find_program_address([b'vault', bytes(credit)], program_id)
     seller_token = get_associated_token_address(seller, mint)
     data = anchor_discriminator('global', 'charge_credit') + amount.to_bytes(8, 'little') + nonce.to_bytes(8, 'little')
-    charge_ix = instruction(program_id, data, [account_meta(buyer.pubkey(), signer=True, writable=True), account_meta(seller, signer=False, writable=False), account_meta(mint, signer=False, writable=False), account_meta(credit, signer=False, writable=True), account_meta(vault, signer=False, writable=True), account_meta(seller_token, signer=False, writable=True), account_meta(TOKEN_PROGRAM_ID, signer=False, writable=False)])
+    charge_ix = instruction(
+        program_id,
+        data,
+        [
+            account_meta(buyer.pubkey(), signer=True, writable=True),
+            account_meta(seller, signer=False, writable=False),
+            account_meta(mint, signer=False, writable=False),
+            account_meta(credit, signer=False, writable=True),
+            account_meta(vault, signer=False, writable=True),
+            account_meta(seller_token, signer=False, writable=True),
+            account_meta(TOKEN_PROGRAM_ID, signer=False, writable=False),
+        ],
+    )
     async with AsyncClient(rpc_url, commitment=COMMITMENT) as client:
         blockhash = cast(Any, (await client.get_latest_blockhash(commitment=COMMITMENT)).value).blockhash
     tx = signed_transaction([charge_ix], buyer, blockhash)
@@ -341,7 +600,14 @@ def encode_x402_payment(tx_base64: str) -> str:
     return base64.b64encode(json.dumps(payment).encode('utf-8')).decode('ascii')
 
 def call_service_with_payment(api_endpoint: str, prompt: str, tx_base64: str) -> tuple[dict[str, Any], str | None]:
-    req = Request(api_endpoint, data=json.dumps({'prompt': prompt}).encode('utf-8'), headers={'Content-Type': 'application/json', 'X-PAYMENT': encode_x402_payment(tx_base64)})
+    req = Request(
+        api_endpoint,
+        data=json.dumps({'prompt': prompt}).encode('utf-8'),
+        headers={
+            'Content-Type': 'application/json',
+            'X-PAYMENT': encode_x402_payment(tx_base64),
+        },
+    )
     try:
         with urlopen(req, timeout=90) as response:
             body = cast(dict[str, Any], json.loads(response.read().decode('utf-8')))
@@ -362,33 +628,78 @@ def decode_payment_response(header: str | None) -> dict[str, Any] | None:
         raise RuntimeError('Service returned an invalid X-PAYMENT-RESPONSE payload')
     return payload
 
-async def _call_service_main(api_endpoint_arg: str | None=None, prompt_arg: str | None=None, buyer_wallet: Keypair | None=None, use_cli_args: bool=True, service_id_arg: str | None=None) -> Any:
+async def _call_service_main(
+    api_endpoint_arg: str | None = None,
+    prompt_arg: str | None = None,
+    buyer_wallet: Keypair | None = None,
+    use_cli_args: bool = True,
+    service_id_arg: str | None = None,
+) -> dict[str, Any]:
     load_dotenv()
-    cli_args = sys.argv[1:] if use_cli_args and api_endpoint_arg is None and (prompt_arg is None) else []
-    api_endpoint = api_endpoint_arg or os.getenv('API_ENDPOINT') or (cli_args[0] if cli_args and cli_args[0].startswith('http') else DEFAULT_API_ENDPOINT)
+    cli_args = (
+        sys.argv[1:]
+        if use_cli_args and api_endpoint_arg is None and prompt_arg is None
+        else []
+    )
+    cli_endpoint = cli_args[0] if cli_args and cli_args[0].startswith('http') else None
+    api_endpoint = api_endpoint_arg or os.getenv('API_ENDPOINT') or cli_endpoint
     service_id = service_id_arg or os.getenv('SERVICE_ID')
-    prompt = prompt_arg or os.getenv('PROMPT') or (cli_args[1] if len(cli_args) > 1 else cli_args[0] if cli_args and (not cli_args[0].startswith('http')) else DEFAULT_PROMPT)
+    cli_prompt = (
+        cli_args[1]
+        if len(cli_args) > 1
+        else cli_args[0]
+        if cli_args and not cli_args[0].startswith('http')
+        else None
+    )
+    prompt = prompt_arg or os.getenv('PROMPT') or cli_prompt
+    if not api_endpoint:
+        raise ValueError(
+            'API_ENDPOINT is required. Set it in .env or pass it to call_service.'
+        )
+    if not prompt:
+        raise ValueError('PROMPT is required. Set it in .env or pass it to call_service.')
     rpc_url = os.getenv('SOLANA_RPC_URL', DEFAULT_SOLANA_RPC_URL)
     buyer = buyer_wallet or load_keypair('BUYER_PRIVATE_KEY', os.getenv('BUYER_PRIVATE_KEY'))
     payment_info = probe_service_payment_info(api_endpoint, prompt)
     service_id = service_id or payment_info.get('extra', {}).get('serviceId')
     seller = Pubkey.from_string(str(payment_info['payTo']))
     if buyer.pubkey() == seller:
-        raise ValueError('BUYER_PRIVATE_KEY resolves to the service seller wallet. Configure a separate buyer wallet key.')
+        raise ValueError(
+            'BUYER_PRIVATE_KEY resolves to the service seller wallet. '
+            'Configure a separate buyer wallet key.'
+        )
     mint = Pubkey.from_string(USDC_MINT)
     program_id = Pubkey.from_string(ESCROW_PROGRAM_ID)
     if str(payment_info['asset']) != USDC_MINT or str(payment_info['extra']['escrowProgramId']) != ESCROW_PROGRAM_ID:
-        raise ValueError('Service payment requirements do not match this SDK escrow program and USDC mint')
+        raise ValueError(
+            'Service payment requirements do not match this SDK escrow program '
+            'and USDC mint'
+        )
     amount = int(str(payment_info['maxAmountRequired']))
     credit, balance, nonce = await read_credit(rpc_url, program_id, buyer.pubkey(), seller, mint)
     if balance < amount:
-        raise ValueError(f'Insufficient prepaid credit ({balance} available, {amount} required). Deposit separately with: python ghostrail_sdk/python/examples/deposit_credit.py')
+        raise ValueError(
+            f'Insufficient prepaid credit ({balance} available, {amount} required). '
+            'Deposit separately with: '
+            'python ghostrail_sdk/python/examples/deposit_credit.py'
+        )
     tx_base64, credit = await create_and_sign_credit_charge(rpc_url, program_id, buyer, seller, mint, amount, nonce)
     result, response_header = call_service_with_payment(api_endpoint, prompt, tx_base64)
     payment_response = decode_payment_response(response_header)
     payment_meta = result.get('payment')
     charge_meta = result.get('charge')
-    if not isinstance(payment_meta, dict) or payment_meta.get('accepted') is not True or (not isinstance(charge_meta, dict)) or (charge_meta.get('success') is not True) or (not payment_response) or (payment_response.get('success') is not True) or (payment_response.get('network') != 'solana-devnet') or (payment_response.get('transaction') != charge_meta.get('signature')):
+    if payment_response is None:
+        raise RuntimeError('Service response did not include a matching confirmed X-PAYMENT-RESPONSE receipt')
+    receipt_is_valid = (
+        isinstance(payment_meta, dict)
+        and payment_meta.get('accepted') is True
+        and isinstance(charge_meta, dict)
+        and charge_meta.get('success') is True
+        and payment_response.get('success') is True
+        and payment_response.get('network') == 'solana-devnet'
+        and payment_response.get('transaction') == charge_meta.get('signature')
+    )
+    if not receipt_is_valid:
         raise RuntimeError('Service response did not include a matching confirmed X-PAYMENT-RESPONSE receipt')
     return {
         'response': result.get('response', result),
@@ -402,7 +713,14 @@ async def _check_credit_main(seller_address: str | None=None, buyer_address: str
     if not seller_arg:
         raise SystemExit('Set BUYER_ADDRESS and SELLER_ADDRESS in examples/check_credit.py')
     load_dotenv()
-    buyer_pubkey = Pubkey.from_string(buyer_address) if buyer_address else load_keypair('BUYER_PRIVATE_KEY', os.getenv('BUYER_PRIVATE_KEY')).pubkey()
+    buyer_pubkey = (
+        Pubkey.from_string(buyer_address)
+        if buyer_address
+        else load_keypair(
+            'BUYER_PRIVATE_KEY',
+            os.getenv('BUYER_PRIVATE_KEY'),
+        ).pubkey()
+    )
     seller = Pubkey.from_string(seller_arg)
     rpc_url = os.getenv('SOLANA_RPC_URL', DEFAULT_SOLANA_RPC_URL)
     program_id = Pubkey.from_string(ESCROW_PROGRAM_ID)
@@ -410,16 +728,14 @@ async def _check_credit_main(seller_address: str | None=None, buyer_address: str
     credit, balance, _ = await read_credit(rpc_url, program_id, buyer_pubkey, seller, mint)
     return format_usdc(balance).split()[0]
 
-FACILITATOR_URL = 'https://ghostrail-five.vercel.app'
-
-MIN_CREDIT_DEPOSIT = 1000000
-
-MAX_CREDIT_BALANCE = 100000000
-
 def usage() -> str:
     return 'Set SELLER_ADDRESS and AMOUNT_USDC in examples/deposit_credit.py'
 
-async def _deposit_credit_main(seller_public_key: str | None=None, amount_usdc: str | None=None, buyer_wallet: Keypair | None=None) -> dict[str, object]:
+async def _deposit_credit_main(
+    seller_public_key: str | None = None,
+    amount_usdc: str | None = None,
+    buyer_wallet: Keypair | None = None,
+) -> dict[str, object]:
     cli_args = sys.argv[1:] if seller_public_key is None else []
     seller_arg = seller_public_key or (cli_args[0] if cli_args else None)
     amount_arg = amount_usdc or (cli_args[1] if len(cli_args) == 2 else None)
@@ -445,7 +761,7 @@ async def _deposit_credit_main(seller_public_key: str | None=None, amount_usdc: 
     print(f'Credit account: {credit}')
     print(f'Deposit : {format_usdc(amount)}')
     tx_base64, _ = await create_and_sign_credit_deposit(rpc_url, program_id, buyer, seller, mint, amount)
-    facilitator_url = os.getenv('FACILITATOR_URL', FACILITATOR_URL)
+    facilitator_url = DEFAULT_FACILITATOR_URL
     result = submit_credit_deposit(facilitator_url, tx_base64)
     print(f"Deposit confirmed: {result['signature']}")
     print(f"Available credit : {format_usdc(int(result['balance']))}")
@@ -476,40 +792,66 @@ async def _withdraw_credit_main(seller_public_key: str | None=None, buyer_wallet
     return signature
 
 class Buyer:
+    """Synchronous Python facade for GHOSTRAIL buyer operations."""
 
     @staticmethod
-    def _run(coroutine):
+    def _run(coroutine: Any) -> Any:
         load_dotenv()
         return asyncio.run(coroutine)
 
     @staticmethod
-    def _signer(private_key):
+    def _signer(private_key: str | None) -> Keypair:
         load_dotenv()
         return load_keypair("BUYER_PRIVATE_KEY", private_key or os.getenv("BUYER_PRIVATE_KEY"))
 
-    def call_service(self, buyer_private_key, api_endpoint=None, prompt=None, service_id=None):
+    def call_service(
+        self,
+        buyer_private_key: str | None,
+        api_endpoint: str | None = None,
+        prompt: str | None = None,
+        service_id: str | None = None,
+    ) -> dict[str, Any]:
         signer = self._signer(buyer_private_key)
         return self._run(_call_service_main(api_endpoint, prompt, signer, False, service_id))
 
-    def check_credit(self, buyer_address, seller_address):
+    def check_credit(
+        self,
+        buyer_address: str | None,
+        seller_address: str,
+    ) -> str:
         return self._run(_check_credit_main(seller_address, str(buyer_address)))
 
     def deposit_credit(
         self,
-        buyer_private_key,
-        seller_address,
+        buyer_private_key: str | None,
+        seller_address: str,
         amount_usdc: str | None = "1",
-    ):
+    ) -> dict[str, object]:
         signer = self._signer(buyer_private_key)
         return self._run(_deposit_credit_main(seller_address, amount_usdc, signer))
 
-    def withdraw_credit(self, buyer_private_key, seller_address):
+    def withdraw_credit(
+        self,
+        buyer_private_key: str | None,
+        seller_address: str,
+    ) -> str | None:
         signer = self._signer(buyer_private_key)
         return self._run(_withdraw_credit_main(seller_address, signer))
 
-    def refund_escrow(self, buyer_private_key, escrow_address):
+    def refund_escrow(
+        self,
+        buyer_private_key: str | None,
+        escrow_address: str | None = None,
+    ) -> dict[str, Any]:
         signer = self._signer(buyer_private_key)
         return self._run(settle_escrow_action('refund', escrow_address, signer))
+
+    def refund_all_expired_escrows(
+        self,
+        buyer_private_key: str | None,
+    ) -> list[dict[str, Any]]:
+        signer = self._signer(buyer_private_key)
+        return self._run(refund_all_expired_escrows(signer))
 
 
 __all__ = ["Buyer"]
