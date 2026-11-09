@@ -143,6 +143,8 @@ async def ensure_token_account(client: AsyncClient, payer: Keypair, mint: Pubkey
 
 async def settle_escrow_action(action: str, escrow_address_str: str, authority: Keypair | None=None) -> dict[str, Any]:
     load_dotenv()
+    if action not in ('release', 'refund'):
+        raise ValueError('Escrow action must be release or refund')
     from spl.token.constants import TOKEN_PROGRAM_ID
     import time
     rpc_url = os.getenv('SOLANA_RPC_URL', DEFAULT_SOLANA_RPC_URL)
@@ -173,8 +175,12 @@ async def settle_escrow_action(action: str, escrow_address_str: str, authority: 
                 raise ValueError('A signing key is required for settlement')
         if action == 'release' and authority.pubkey() != seller:
             raise ValueError(f'Signing key {authority.pubkey()} does not match escrow seller {seller}')
-        facilitator_value = os.getenv('FACILITATOR_PUBLIC_KEY')
-        facilitator = Pubkey.from_string(facilitator_value) if facilitator_value else load_keypair('FACILITATOR_PRIVATE_KEY', os.getenv('FACILITATOR_PRIVATE_KEY')).pubkey()
+        facilitator = None
+        if action == 'release':
+            facilitator_value = os.getenv('FACILITATOR_PUBLIC_KEY')
+            facilitator = Pubkey.from_string(facilitator_value) if facilitator_value else load_keypair('FACILITATOR_PRIVATE_KEY', os.getenv('FACILITATOR_PRIVATE_KEY')).pubkey()
+        if action == 'refund' and authority.pubkey() != buyer:
+            raise ValueError('Only the buyer recorded in the escrow can submit a manual refund')
         if action == 'release' and authority.pubkey() == facilitator:
             raise ValueError('The facilitator cannot be the escrow authority')
         recipient = seller if action == 'release' else buyer
@@ -185,7 +191,13 @@ async def settle_escrow_action(action: str, escrow_address_str: str, authority: 
         else:
             settlement_instruction = instruction(program_id, REFUND_DISCRIMINATOR, [account_meta(authority.pubkey(), signer=True, writable=False), account_meta(buyer, signer=False, writable=True), account_meta(seller, signer=False, writable=False), account_meta(mint, signer=False, writable=False), account_meta(escrow_address, signer=False, writable=True), account_meta(vault, signer=False, writable=True), account_meta(recipient_token, signer=False, writable=True), account_meta(TOKEN_PROGRAM_ID, signer=False, writable=False)])
         blockhash = cast(Any, (await client.get_latest_blockhash(commitment=COMMITMENT)).value).blockhash
-        transaction = partially_signed_transaction([settlement_instruction], facilitator, authority, blockhash)
+        if action == 'release':
+            if facilitator is None:
+                raise RuntimeError('The facilitator fee payer is unavailable for release')
+            payer = facilitator
+        else:
+            payer = authority.pubkey()
+        transaction = partially_signed_transaction([settlement_instruction], payer, authority, blockhash)
     status, result = facilitator_request(facilitator_url, 'PUT', {'escrowAddress': str(escrow_address), 'action': action, 'transaction': transaction_base64(transaction)})
     if status < 200 or status >= 300 or result.get('success') is not True:
         raise RuntimeError(f'Settlement failed: {result}')
@@ -494,6 +506,10 @@ class Buyer:
     def withdraw_credit(self, buyer_private_key, seller_address):
         signer = self._signer(buyer_private_key)
         return self._run(_withdraw_credit_main(seller_address, signer))
+
+    def refund_escrow(self, buyer_private_key, escrow_address):
+        signer = self._signer(buyer_private_key)
+        return self._run(settle_escrow_action('refund', escrow_address, signer))
 
 
 __all__ = ["Buyer"]

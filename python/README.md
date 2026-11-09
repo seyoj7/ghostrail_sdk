@@ -22,7 +22,7 @@ python -m pip install -r python\requirements.txt
 
 If PowerShell blocks activation, run `Set-ExecutionPolicy -Scope Process Bypass` first, or invoke `.venv\Scripts\python.exe` directly.
 
-Fill in `.env` for your devnet setup. `BUYER_PRIVATE_KEY` is the buyer's base58 private key and signs buyer transactions. `BUYER_ADDRESS` and `SELLER_ADDRESS` are public wallet addresses. The SDK has the devnet escrow program ID and USDC mint built in; only the Solana RPC URL is configurable. `SELLER_PRIVATE_KEY`, `FACILITATOR_PRIVATE_KEY`, and `FACILITATOR_PUBLIC_KEY` are optional for flows that need them. Keep `.env` and service delete tokens private.
+Fill in `.env` for your devnet setup. `BUYER_PRIVATE_KEY` is the buyer's base58 private key and signs buyer transactions. `BUYER_ADDRESS` and `SELLER_ADDRESS` are public wallet addresses. The SDK has the devnet escrow program ID and USDC mint built in; only the Solana RPC URL is configurable. `SELLER_PRIVATE_KEY`, `FACILITATOR_PRIVATE_KEY`, and `FACILITATOR_PUBLIC_KEY` are optional for flows that need them. Set `GHOSTRAIL_ACTION=refund` and `ESCROW_ADDRESS` to run the refund flow through the call-service example. Keep `.env` and service delete tokens private.
 
 The SDK defaults to `https://ghostrail-five.vercel.app`; set `FACILITATOR_URL` in `.env` to use another facilitator.
 
@@ -53,6 +53,11 @@ Withdraw the remaining credit for `SELLER_ADDRESS`:
 ```powershell
 python -m python.examples.withdraw_credit
 ```
+
+To refund an expired escrow, set `GHOSTRAIL_ACTION=refund` and
+`ESCROW_ADDRESS` in `.env`, then run the existing call-service example. The
+buyer wallet needs devnet SOL for the transaction fee. Refunds do not require
+facilitator signing credentials.
 
 Register a service by setting `SERVICE_NAME`, `API_ENDPOINT`, `SELLER_ADDRESS`, and `PRICE_USDC` in `.env`. Set `API_ENDPOINT` to your service API, such as `http://127.0.0.1:8080/chat` locally; outside localhost it must use HTTPS. The script prints the service ID and one-time delete token. Store the token securely, and set `SERVICE_ID` and `DELETE_TOKEN` in `.env` to delete the registration later.
 

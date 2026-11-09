@@ -399,9 +399,14 @@ export class Ghostrail {
       throw new Error(`Signing key ${authority.publicKey.toBase58()} does not match escrow seller ${seller.toBase58()}`);
     }
 
-    const facilitator = process.env.FACILITATOR_PUBLIC_KEY
-      ? asPublicKey(process.env.FACILITATOR_PUBLIC_KEY, "FACILITATOR_PUBLIC_KEY")
-      : asKeypair(process.env.FACILITATOR_PRIVATE_KEY).publicKey;
+    const facilitator = action === "release"
+      ? process.env.FACILITATOR_PUBLIC_KEY
+        ? asPublicKey(process.env.FACILITATOR_PUBLIC_KEY, "FACILITATOR_PUBLIC_KEY")
+        : asKeypair(process.env.FACILITATOR_PRIVATE_KEY).publicKey
+      : null;
+    if (action === "refund" && !authority.publicKey.equals(buyer)) {
+      throw new Error("Only the buyer recorded in the escrow can submit a manual refund");
+    }
     if (action === "release" && authority.publicKey.equals(facilitator)) {
       throw new Error("The facilitator cannot be the escrow authority");
     }
@@ -438,7 +443,10 @@ export class Ghostrail {
       data: action === "release" ? RELEASE_DISCRIMINATOR : REFUND_DISCRIMINATOR,
     });
     const { blockhash } = await this.connection.getLatestBlockhash(COMMITMENT);
-    const transaction = new Transaction({ feePayer: facilitator, recentBlockhash: blockhash }).add(instruction);
+    const transaction = new Transaction({
+      feePayer: action === "refund" ? authority.publicKey : facilitator,
+      recentBlockhash: blockhash,
+    }).add(instruction);
     transaction.partialSign(authority);
     const transactionBase64 = transaction.serialize({ requireAllSignatures: false, verifySignatures: false }).toString("base64");
 

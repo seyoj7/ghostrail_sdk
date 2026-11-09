@@ -32,10 +32,14 @@ npm install --prefix node
 Set the wallet and service values in the SDK-root `.env` file. The escrow program ID and devnet USDC mint are fixed in the SDK. The facilitator defaults to `https://ghostrail-five.vercel.app`; set `FACILITATOR_URL` in `.env` to use another facilitator. Node.js 20.6 or newer is required.
 
 For existing escrow settlements, use `releaseEscrow(escrowAddress)` or
-`refundEscrow(escrowAddress)` on a `Ghostrail` client. These use the configured
-seller signer or a caller signer, plus the facilitator signer from `.env`.
-Refunds are permissionless after the escrow timeout and always return funds to
-the buyer recorded in the escrow.
+`refundEscrow(escrowAddress)` on a `Ghostrail` client. Releases use the seller
+signer and facilitator relay. Refunds require the buyer key and devnet SOL for
+the transaction fee. Refunds are available after timeout and return funds to
+the buyer recorded in the escrow. Set `GHOSTRAIL_ACTION=refund` and
+`ESCROW_ADDRESS` in `.env`, then run the existing service-call example. The
+buyer's private key signs the refund locally; the SDK sends only the signed
+transaction to the facilitator. Refunds do not need facilitator signing
+credentials.
 
 ## Examples
 
