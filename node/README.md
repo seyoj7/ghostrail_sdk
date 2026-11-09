@@ -1,93 +1,70 @@
 # GHOSTRAIL Node.js SDK
 
-The GHOSTRAIL Node.js SDK lets buyers call services that require USDC payment and lets sellers register service APIs.
-It uses prepaid credit associated with the buyer and seller wallets.
-Buyers can deposit credit for a seller and use it for multiple services with that seller wallet.
-The SDK signs each service charge and returns the response and receipt details.
-The Node.js buyer client is implemented in `buyer.js` and exported as both `Ghostrail` and `Buyer`.
-Seller registration is implemented in `seller.js` and exported as `ghostrail-sdk/seller`.
-The examples cover service calls, credit checks, deposits, withdrawals, service registration, and service deletion.
-Like the Python SDK, Node loads the SDK-root `.env` file automatically without replacing variables already present in the process environment.
+The GHOSTRAIL Node.js SDK lets buyers call services that require USDC payment and lets sellers register service APIs. Buyers use prepaid credit associated with buyer and seller wallets. The buyer client is in `buyer.js`; seller registration is in `seller.js`. The SDK signs each service charge locally and returns the service response and payment receipt.
 
 ## Dependencies
 
-The Node.js SDK requires Node.js 20.6 or newer and installs these runtime
-dependencies:
+- Node.js 20.6 or newer
+- `@solana/spl-token`, `@solana/web3.js`, and `bs58`
 
-- `@solana/spl-token` — Solana SPL Token account and instruction helpers
-- `@solana/web3.js` — Solana RPC, transaction, and keypair support
-- `bs58` — Base58 private-key decoding
-
-The exact versions are declared in
-[`package.json`](./package.json).
+The exact dependency versions are in [`package.json`](./package.json).
 
 ## Setup
 
-Install dependencies from the SDK directory:
+Run these commands from the SDK directory, the folder containing `node` and `python`:
 
 ```powershell
 npm install --prefix node
 ```
 
+Copy `.env.example` to `.env` and configure the values needed for your flow. The SDK loads the SDK-root `.env` automatically without replacing variables already set in the process environment. Keep private keys and service delete tokens secret.
 
-For existing escrow settlements, use `releaseEscrow(escrowAddress)` or
-`refundEscrow()` on a `Ghostrail` client. Refunds scan the buyer's on-chain
-escrows and automatically select an expired locked escrow. If multiple escrows
-are refundable, pass one explicitly to `refundEscrow(escrowAddress)`. Releases
-use the seller signer and facilitator relay. Refunds are buyer-initiated after
-timeout; they require the buyer key and devnet SOL for the transaction fee.
-The buyer's private key signs the refund locally; the SDK sends only the signed
-transaction to the facilitator. Refunds do not need facilitator signing
-credentials.
+
+## Escrow settlements
+
+Use `releaseEscrow(escrowAddress)` to release an escrow, `refundEscrow(escrowAddress)` to refund one, or `refundAllExpiredEscrows()` to refund all of the buyer's expired, locked escrows. A refund requires the buyer key and devnet SOL for its transaction fee. Refunds do not require facilitator signing credentials. Releases use the seller signer and facilitator relay.
 
 ## Examples
 
-Run these commands from the SDK directory:
+Run these commands from the SDK directory.
+
+Call a service using prepaid credit. Configure `BUYER_PRIVATE_KEY`, `API_ENDPOINT`, and `PROMPT` in `.env`:
 
 ```powershell
 node node/examples/call-service.mjs
 ```
 
-Calls a paid service using prepaid credit. Prints the response, transaction,
-API endpoint, and service ID. Configure `API_ENDPOINT` and `PROMPT` in `.env`.
-
-Submit refunds for all of the buyer's expired, locked escrows without calling a
-paid service. The script submits one buyer-signed transaction per escrow; each
-transaction requires devnet SOL for its network fee.
-
-```powershell
-node node/examples/refund-escrow.mjs
-```
+Check credit between `BUYER_ADDRESS` and `SELLER_ADDRESS`:
 
 ```powershell
 node node/examples/check-credit.mjs
 ```
 
-Checks and prints available credit using `BUYER_ADDRESS` and `SELLER_ADDRESS`.
+Deposit `DEPOSIT_USDC` (default `1`) as credit for `SELLER_ADDRESS`:
 
 ```powershell
 node node/examples/deposit-credit.mjs
 ```
 
-Deposits `DEPOSIT_USDC` (default `1`) into credit for `SELLER_ADDRESS`.
+Withdraw the remaining credit for `SELLER_ADDRESS`:
 
 ```powershell
 node node/examples/withdraw-credit.mjs
 ```
 
-Withdraws the remaining credit for `SELLER_ADDRESS`.
+Refund all expired, locked escrows belonging to the buyer without calling a paid service. Each refund needs devnet SOL for its transaction fee:
 
-Register a service using `SERVICE_NAME`, `API_ENDPOINT`, `SELLER_ADDRESS`, and
-`PRICE_USDC` from `.env`. For local development, set `API_ENDPOINT` to
-`http://127.0.0.1:8080/chat`, then run:
+```powershell
+node node/examples/refund-escrow.mjs
+```
+
+Register a service by setting `SERVICE_NAME`, `API_ENDPOINT`, `SELLER_ADDRESS`, and `PRICE_USDC` in `.env`. The endpoint must use HTTPS except for localhost development. The script prints the service ID and one-time delete token; store the token securely:
 
 ```powershell
 node node/examples/register-service.mjs
 ```
 
-The API Endpoint must use HTTPS except for localhost development. The script prints
-the service ID and one-time `deleteToken` returned by the facilitator. Keep the
-token private, then set `SERVICE_ID` and `DELETE_TOKEN` in `.env` and run:
+Set `SERVICE_ID` and `DELETE_TOKEN` in `.env` to delete the registration:
 
 ```powershell
 node node/examples/delete-service.mjs
